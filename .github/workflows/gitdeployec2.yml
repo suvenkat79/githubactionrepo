@@ -1,0 +1,174 @@
+name: Deploy EC2 Instance
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to (dev, staging, prod)'
+        required: true
+        default: 'dev'
+      instance_type:
+        description: 'EC2 instance type'
+        required: true
+        default: 't2.micro'
+      ami_id:
+        description: 'AMI ID (leave empty for latest Amazon Linux 2)'
+        required: false
+      key_name:
+        description: 'SSH Key name'
+        required: true
+
+jobs:
+  validate-inputs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate environment
+        run: |
+          if [[ "${{ github.event.inputs.environment }}" != "dev" && "${{ github.event.inputs.environment }}" != "staging" && "${{ github.event.inputs.environment }}" != "prod" ]]; then
+            echo "Error: environment must be one of: dev, staging, prod"
+            exit 1
+          fi
+          echo "Environment validation passed"
+      
+      - name: Validate instance type
+        run: |
+          VALID_TYPES=("t2.micro" "t2.small" "t3.micro" "t3.small" "m5.large")
+          if [[ ! " ${VALID_TYPES[@]} " =~ " ${{ github.event.inputs.instance_type }} " ]]; then
+            echo "Error: instance_type must be one of the allowed types"
+            exit 1
+          fi
+          echo "Instance type validation passed"
+
+  deploy-ec2:
+    needs: validate-inputs
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+
+    - name: Get latest Amazon Linux 2 AMI if not specified
+      if: ${{ github.event.inputs.ami_id == '' }}
+      id: get-ami
+      run: |
+        AMI_ID=$(aws ec2 describe-images \
+          --owners amazon \
+          --filters "Name=name,Values=amzn2-ami-hvm-2.0.*-x86_64-gp2" "Name=state,Values=available" \
+          --query "sort_by(Images, &CreationDate)[-1].ImageId" \
+          --output text)
+        echo "ami_id=$AMI_ID" >> $GITHUB_ENV
+        echo "Using latest Amazon Linux 2 AMI: $AMI_ID"
+
+    - name: Use specified AMI
+      if: ${{ github.event.inputs.ami_id != '' }}
+      run: |
+        echo "ami_id=${{ github.event.inputs.ami_id }}" >> $GITHUB_ENV
+        echo "Using specified AMI: ${{ github.event.inputs.ami_id }}"
+
+    - name: Create CloudFormation stack
+      run: |
+        cat > ec2-template.yaml <<EOF
+        AWSTemplateFormatVersion: '2010-09-09'
+        Description: 'EC2 instance deployment'
+        
+        Resources:
+          EC2Instance:
+            Type: 'AWS::EC2::Instance'
+            Properties:
+              InstanceType: ${{ github.event.inputs.instance_type }}
+              ImageId: ${{ env.ami_id }}
+              KeyName: ${{ github.event.inputs.key_name }}
+              SecurityGroups:
+                - !Ref InstanceSecurityGroup
+              Tags:
+                - Key: Name
+                  Value: !Sub 'ec2-${{ github.event.inputs.environment }}-${AWS::StackName}'
+                - Key: Environment
+                  Value: ${{ github.event.inputs.environment }}
+          
+          InstanceSecurityGroup:
+            Type: 'AWS::EC2::SecurityGroup'
+            Properties:
+              GroupDescription: Enable SSH access
+              SecurityGroupIngress:
+                - IpProtocol: tcp
+                  FromPort: 22
+                  ToPort: 22
+                  CidrIp: 0.0.0.0/0
+        
+        Outputs:
+          InstanceId:
+            Description: EC2 Instance ID
+            Value: !Ref EC2Instance
+          PublicIP:
+            Description: EC2 Public IP
+            Value: !GetAtt EC2Instance.PublicIp
+          PublicDNS:
+            Description: EC2 Public DNS
+            Value: !GetAtt EC2Instance.PublicDnsName
+        EOF
+
+        STACK_NAME="ec2-${{ github.event.inputs.environment }}-$(date +%Y%m%d%H%M%S)"
+        
+        aws cloudformation create-stack \
+          --stack-name $STACK_NAME \
+          --template-body file://ec2-template.yaml \
+          --capabilities CAPABILITY_IAM
+        
+        echo "stack_name=$STACK_NAME" >> $GITHUB_ENV
+        
+        echo "Waiting for stack creation to complete..."
+        aws cloudformation wait stack-create-complete --stack-name $STACK_NAME
+
+    - name: Get deployment outputs
+      id: get-outputs
+      run: |
+        INSTANCE_ID=$(aws cloudformation describe-stacks \
+          --stack-name ${{ env.stack_name }} \
+          --query "Stacks[0].Outputs[?OutputKey=='InstanceId'].OutputValue" \
+          --output text)
+        
+        PUBLIC_IP=$(aws cloudformation describe-stacks \
+          --stack-name ${{ env.stack_name }} \
+          --query "Stacks[0].Outputs[?OutputKey=='PublicIP'].OutputValue" \
+          --output text)
+        
+        PUBLIC_DNS=$(aws cloudformation describe-stacks \
+          --stack-name ${{ env.stack_name }} \
+          --query "Stacks[0].Outputs[?OutputKey=='PublicDNS'].OutputValue" \
+          --output text)
+        
+        echo "Instance ID: $INSTANCE_ID"
+        echo "Public IP: $PUBLIC_IP"
+        echo "Public DNS: $PUBLIC_DNS"
+        
+        echo "instance_id=$INSTANCE_ID" >> $GITHUB_ENV
+        echo "public_ip=$PUBLIC_IP" >> $GITHUB_ENV
+        echo "public_dns=$PUBLIC_DNS" >> $GITHUB_ENV
+    
+    - name: Create deployment summary
+      run: |
+        echo "## EC2 Deployment Summary" > deployment-summary.md
+        echo "* **Environment**: ${{ github.event.inputs.environment }}" >> deployment-summary.md
+        echo "* **Instance Type**: ${{ github.event.inputs.instance_type }}" >> deployment-summary.md
+        echo "* **AMI ID**: ${{ env.ami_id }}" >> deployment-summary.md
+        echo "* **Stack Name**: ${{ env.stack_name }}" >> deployment-summary.md
+        echo "* **Instance ID**: ${{ env.instance_id }}" >> deployment-summary.md
+        echo "* **Public IP**: ${{ env.public_ip }}" >> deployment-summary.md
+        echo "* **Public DNS**: ${{ env.public_dns }}" >> deployment-summary.md
+        
+        cat deployment-summary.md
+    
+    - name: Upload deployment summary
+      uses: actions/upload-artifact@v3
+      with:
+        name: deployment-summary
+        path: deployment-summary.md
